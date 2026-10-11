@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Verify byte-matched C and land it in src/matched/ + matched.json."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+import groups  # noqa: E402
+from fnfiles import stem_for  # noqa: E402
+MANIFEST = ROOT / "analysis" / "matched.json"
+MATCH = ROOT / "asm" / "matchings"
+SRC_MATCHED = ROOT / "src" / "matched"
+MATCH_SCRIPT = ROOT / "tools" / "decomp" / "match_function.py"
+GEN = ROOT / "tools" / "decomp" / "gen_rom_layout.py"
+VERIFIED = ROOT / "analysis" / "semantic_verified.json"
+
+sys.path.insert(0, str(ROOT / "tools" / "decomp"))
+from asm_bytes import addr_from_name, retail_bytes, write_matching_bytes  # noqa: E402
+from match_function import (  # noqa: E402
+    compile_c,
+    normalize_compiled,
+    obj_text_bytes,
+    reference_size,
+    write_single_function_c,
+)
+
+
+def load_manifest() -> dict:
+    if MANIFEST.is_file():
+        return json.loads(MANIFEST.read_text())
+    return {"functions": []}
+
+
+def save_manifest(data: dict) -> None:
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    MANIFEST.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def record_semantic_verified(name: str, body: str, kind: str) -> None:
+    """Register a landed semantic function in `analysis/semantic_verified.json`.
+
+    `progress.py` and `tier.py` treat that file as the record of *verified*
+    semantics: `file_kind()` guesses "semantic" from the text (no `asm()`), which
+    is spoofable, so a guess is demoted to `asm` unless the name is listed here.
+    Only `matched_rescore.py --write-verified` used to write it, which meant
+    semantic C landed through `integrate_c.py` (or the permuter, which calls it)
+    stayed invisible to the progress counter — the byte-match count moved but the
+    semantic-C milestone did not.
+    """
+    if kind != "semantic":
+        return
+    if VERIFIED.is_file():
+        data = json.loads(VERIFIED.read_text())
+    else:
+        data = {"functions": {}}
+    functions = data.setdefault("functions", {})
+    functions[name] = {
+        "pct": 100.0,
+        "compiler": "old_agbcc" if "match-compiler: old_agbcc" in body else "agbcc",
+        "score": "integrated",
+    }
+    VERIFIED.parent.mkdir(parents=True, exist_ok=True)
+    VERIFIED.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def verify(function: str, c_path: Path) -> bool:
+    result = subprocess.run(
+        [sys.executable, str(MATCH_SCRIPT), function, str(c_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+    return result.returncode == 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Integrate verified C for a matched function")
+    parser.add_argument("function")
+    parser.add_argument("c_body", help='C function body (or "@" + path to read body from)')
+    parser.add_argument("--note", default="", help="conversion note for manifest")
+    parser.add_argument(
+        "--kind",
+        choices=("semantic", "opcode", "asm"),
+        default="",
+        help="semantic = readable C; asm = readable Thumb; opcode = .byte embed",
+    )
+    parser.add_argument(
+        "--skip-compare",
+        action="store_true",
+        help="skip make compare (batch runners verify once at end)",
+    )
+    args = parser.parse_args()
+
+    name = args.function
+    if args.c_body.startswith("@") and len(args.c_body) > 1:
+        body_path = Path(args.c_body[1:])
+        if not body_path.is_file():
+            body_path = ROOT / args.c_body[1:]
+        body = body_path.read_text()
+    else:
+        body = args.c_body
+
+    SRC_MATCHED.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        scratch = Path(tmp) / "scratch.c"
+        write_single_function_c(name, body, scratch)
+        if not verify(name, scratch):
+            return 2
+        compile_c(scratch, Path(tmp) / "out.o")
+        size = reference_size(name)
+        got = normalize_compiled(obj_text_bytes(Path(tmp) / "out.o", name), size)
+        want = retail_bytes(name, size)
+        if got != want:
+            print(f"bytes mismatch after normalize for {name}", file=sys.stderr)
+            return 2
+        landed = groups.land(name, scratch.read_text())
+        rel_src = str(landed.relative_to(ROOT))
+
+    write_matching_bytes(name, want, MATCH / f"{name}.s")
+
+    data = load_manifest()
+    kind = args.kind
+    if not kind:
+        if '__attribute__((naked))' in body and 'asm(".byte' in body:
+            kind = "opcode"
+        elif "__attribute__((naked))" in body and "asm(" in body:
+            kind = "asm"
+        else:
+            kind = "semantic"
+
+    if kind == "semantic" and (
+        "__attribute__((naked))" in body and "asm(" in body
+    ):
+        print(
+            f"refusing --kind semantic for {name}: naked inline asm is not semantic C",
+            file=sys.stderr,
+        )
+        return 2
+
+    entry = {
+        "name": name,
+        "addr": f"0x{addr_from_name(name):08X}",
+        "src": rel_src,
+        "mode": "c",
+        "kind": kind,
+    }
+    if args.note:
+        entry["note"] = args.note
+    data["functions"] = [f for f in data["functions"] if f["name"] != name]
+    data["functions"].append(entry)
+    save_manifest(data)
+    record_semantic_verified(name, body, kind)
+
+    result = subprocess.run([sys.executable, str(GEN)], check=False)
+    if result.returncode != 0:
+        return result.returncode
+
+    if not args.skip_compare:
+        subprocess.run(["make", "compare"], cwd=str(ROOT), check=True)
+    print(f"integrated C for {name} -> {rel_src}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

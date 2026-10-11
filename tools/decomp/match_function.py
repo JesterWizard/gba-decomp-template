@@ -1,0 +1,673 @@
+#!/usr/bin/env python3
+"""Compile scratch C and compare .text to retail baserom bytes.
+
+Per-function extra agbcc flags: `/* match-flags: -fprologue-bugfix */` in the .c
+(see extra_cflags). Needed for some `bx lr` leaves (sub_0802B994).
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[2]
+NONMATCH = ROOT / "asm" / "nonmatchings"
+MATCH = ROOT / "asm" / "matchings"
+BASEROM = ROOT / "baserom.gba"
+AGBCC = ROOT / "tools/agbcc/bin/agbcc"
+SCORES_JSON = ROOT / "docs" / "decomp-function-scores.json"
+ROM_BASE = 0x08000000
+CPPFLAGS = [
+    "-iquote",
+    "include",
+    "-Wno-trigraphs",
+    "-DMODERN=0",
+    "-I",
+    "tools/agbcc/include",
+    "-I",
+    "tools/agbcc",
+    "-nostdinc",
+    "-undef",
+    "-std=gnu89",
+]
+
+sys.path.insert(0, str(ROOT / "tools" / "decomp"))
+from asm_bytes import addr_from_name, asm_text_bytes, retail_bytes  # noqa: E402
+
+# Per-function agbcc flags, parsed from `/* match-flags: ... */` in the C file.
+# gcc -E strips comments, so these are read from the original .c (not the .i).
+MATCH_FLAGS_RE = re.compile(r"/\*\s*match-flags:\s*(.*?)\s*\*/")
+ALLOWED_MATCH_FLAGS = frozenset(
+    {
+        "-fprologue-bugfix",
+        "-fomit-frame-pointer",
+        # Library code built at -O1 (Nintendo EEPROM routines around 0x080674xx);
+        # overrides the default -O2 because it is passed after it.
+        "-O1",
+    }
+)
+
+# Per-function compiler selection, parsed from `/* match-compiler: old_agbcc */`.
+# pret/agbcc's install.sh ships two compilers and they do not generate identical
+# code: for a subset of functions only `old_agbcc` reaches retail (it does not
+# coalesce a load into the register that consumes it, among other differences).
+# See docs/decomp-status.md 2026-09-21.
+MATCH_COMPILER_RE = re.compile(r"/\*\s*match-compiler:\s*(\S+?)\s*\*/")
+COMPILERS: dict[str, Path] = {
+    "agbcc": AGBCC,
+    "old_agbcc": ROOT / "tools" / "agbcc" / "bin" / "old_agbcc",
+}
+DEFAULT_COMPILER = "agbcc"
+
+# Per-function assembly fixups, parsed from `/* match-fixup: mov-pc-lr */`.
+# agbcc hard-codes `bx lr` for every Thumb return, but a few retail leaves
+# (sub_08074144) return with the pre-interwork `mov pc, lr` (46F7 vs 4770).
+# The C stays plain; the fixup rewrites the return in the generated .s.
+MATCH_FIXUP_RE = re.compile(r"/\*\s*match-fixup:\s*(\S+?)\s*\*/")
+ALLOWED_MATCH_FIXUPS = frozenset({"mov-pc-lr"})
+_BX_LR_RE = re.compile(r"^(\s*)bx\s+lr\s*$", re.M)
+
+
+def apply_match_fixups(c_path: Path, asm_path: Path) -> None:
+    """Rewrite agbcc output per `/* match-fixup: ... */` before assembling."""
+    try:
+        text = c_path.read_text()
+    except OSError:
+        return
+    for match in MATCH_FIXUP_RE.finditer(text):
+        name = match.group(1)
+        if name not in ALLOWED_MATCH_FIXUPS:
+            raise ValueError(
+                f"unknown match-fixup `{name}` in {c_path}; "
+                f"allowed: {sorted(ALLOWED_MATCH_FIXUPS)}"
+            )
+        asm = asm_path.read_text()
+        asm_path.write_text(_BX_LR_RE.sub(r"\1mov\tpc, lr", asm))
+
+
+def match_compiler(c_path: Path) -> Path:
+    """Return the agbcc binary this C file must be compiled with."""
+    try:
+        text = c_path.read_text()
+    except OSError:
+        return COMPILERS[DEFAULT_COMPILER]
+    match = MATCH_COMPILER_RE.search(text)
+    if not match:
+        return COMPILERS[DEFAULT_COMPILER]
+    name = match.group(1).strip()
+    if name not in COMPILERS:
+        raise ValueError(
+            f"unknown match-compiler `{name}` in {c_path}; "
+            f"allowed: {sorted(COMPILERS)}"
+        )
+    compiler = COMPILERS[name]
+    if not compiler.is_file():
+        raise FileNotFoundError(f"{name} missing at {compiler} — run build_tools.sh")
+    return compiler
+
+# `register`, GCC asm labels, and empty compiler barriers are not semantic C.
+# Naked Thumb wrappers and BIOS `swi` are the only allowed asm().
+_COMMENT_BLOCK_RE = re.compile(r"/\*.*?\*/", re.S)
+_COMMENT_LINE_RE = re.compile(r"//.*?$", re.M)
+_NAKED_RE = re.compile(r"__attribute__\s*\(\s*\(\s*naked\s*\)\s*\)")
+_REGISTER_KW_RE = re.compile(r"\bregister\b")
+_ASM_STRING_RE = re.compile(
+    r"\basm(?:\s+volatile)?\s*\(\s*\"((?:[^\"\\]|\\.)*)\"",
+    re.I,
+)
+_SWI_ASM_RE = re.compile(r"^\s*swi\b", re.I)
+
+
+class BannedAsmError(ValueError):
+    """Semantic C used register, a GCC asm label, or non-SWI inline asm."""
+
+
+def _c_without_comments(text: str) -> str:
+    text = _COMMENT_BLOCK_RE.sub("", text)
+    return _COMMENT_LINE_RE.sub("", text)
+
+
+def banned_semantic_asm(text: str) -> str | None:
+    """Return a reason if this is semantic C with banned match cheats."""
+    if _NAKED_RE.search(text):
+        return None
+    body = _c_without_comments(text)
+    if _REGISTER_KW_RE.search(body):
+        return "`register` is banned in semantic C"
+    for match in _ASM_STRING_RE.finditer(body):
+        inner = bytes(match.group(1), "utf-8").decode("unicode_escape")
+        if _SWI_ASM_RE.match(inner):
+            continue
+        if inner.strip() == "":
+            return 'empty asm("") barrier is banned in semantic C'
+        snippet = inner.replace("\n", "\\n")[:48]
+        return f'inline asm("{snippet}") is banned in semantic C'
+    return None
+
+
+def check_semantic_asm(c_path: Path) -> None:
+    reason = banned_semantic_asm(c_path.read_text())
+    if reason:
+        raise BannedAsmError(f"{c_path}: {reason}")
+
+
+def extra_cflags(c_path: Path) -> list[str]:
+    try:
+        text = c_path.read_text()
+    except OSError:
+        return []
+    flags: list[str] = []
+    for match in MATCH_FLAGS_RE.finditer(text):
+        flags.extend(shlex.split(match.group(1)))
+    unknown = [flag for flag in flags if flag not in ALLOWED_MATCH_FLAGS]
+    if unknown:
+        raise ValueError(
+            f"unsupported match-flags in {c_path}: {unknown}; "
+            f"allowed: {sorted(ALLOWED_MATCH_FLAGS)}"
+        )
+    return flags
+
+
+DATA_SYMBOLS = ROOT / "asm" / "data_symbols.s"
+SET_DATA_RE = re.compile(
+    r"^(?:SET_DATA|SET_ROM_DATA)\s+([A-Za-z_][A-Za-z0-9_]*)\s*,\s*(0x[0-9A-Fa-f]+|\d+)\s*$"
+)
+
+
+def data_symbol_value(name: str) -> int | None:
+    """Absolute value of a project data symbol (see asm/data_symbols.s)."""
+    if not DATA_SYMBOLS.is_file():
+        return None
+    for line in DATA_SYMBOLS.read_text().splitlines():
+        match = SET_DATA_RE.match(line.split("@")[0].strip())
+        if match and match.group(1) == name:
+            return int(match.group(2), 0)
+    return None
+
+
+def data_symbol_defsyms() -> list[str]:
+    """`--defsym` args so RAM/IO `gData_…` resolve at assembly time.
+
+    ROM symbols are peel labels (`SET_ROM_DATA`); baking those with --defsym
+    would hide R_ARM_ABS32 relocs the linker needs when code slides.
+    """
+    args: list[str] = []
+    if not DATA_SYMBOLS.is_file():
+        return args
+    for line in DATA_SYMBOLS.read_text().splitlines():
+        match = SET_DATA_RE.match(line.split("@")[0].strip())
+        if match and line.split("@")[0].strip().startswith("SET_DATA"):
+            args += ["--defsym", f"{match.group(1)}={match.group(2)}"]
+    return args
+
+
+def preprocess(c_path: Path, out_path: Path, *, quiet: bool = False) -> None:
+    extra = {"capture_output": True, "text": True} if quiet else {}
+    subprocess.run(
+        ["arm-none-eabi-gcc", "-E", *CPPFLAGS, str(c_path), "-o", str(out_path)],
+        check=True,
+        cwd=str(ROOT),
+        **extra,
+    )
+
+
+def compile_c(
+    c_path: Path,
+    obj_path: Path,
+    *,
+    quiet: bool = False,
+    extra_flags: list[str] | None = None,
+) -> None:
+    asm_path = obj_path.with_suffix(".s")
+    with tempfile.NamedTemporaryFile(suffix=".i", delete=False) as tmp:
+        i_path = Path(tmp.name)
+    extra = {"capture_output": True, "text": True} if quiet else {}
+    flags = list(extra_flags) if extra_flags else extra_cflags(c_path)
+    compiler = match_compiler(c_path)
+    try:
+        preprocess(c_path, i_path, quiet=quiet)
+        subprocess.run(
+            [
+                str(compiler),
+                str(i_path),
+                "-o",
+                str(asm_path),
+                "-mthumb-interwork",
+                "-Wimplicit",
+                "-Wparentheses",
+                "-Werror",
+                "-O2",
+                "-g",
+                "-fhex-asm",
+                *flags,
+            ],
+            check=True,
+            cwd=str(ROOT),
+            **extra,
+        )
+    finally:
+        i_path.unlink(missing_ok=True)
+    apply_match_fixups(c_path, asm_path)
+    subprocess.run(
+        [
+            "arm-none-eabi-as",
+            "-mcpu=arm7tdmi",
+            "-mthumb-interwork",
+            *data_symbol_defsyms(),
+            str(asm_path),
+            "-o",
+            str(obj_path),
+        ],
+        check=True,
+        **extra,
+    )
+
+
+def encode_thumb_bl(from_addr: int, to_addr: int) -> bytes:
+    """R_ARM_THM_CALL: 32-bit Thumb BL from `from_addr` to `to_addr`."""
+    offset = to_addr - (from_addr + 4)
+    hw1 = 0xF000 | ((offset >> 12) & 0x7FF)
+    hw2 = 0xF800 | ((offset >> 1) & 0x7FF)
+    return hw1.to_bytes(2, "little") + hw2.to_bytes(2, "little")
+
+
+# ROM address of libgcc `_call_via_r0` (0x08073C40..0x08073C77: bx r0 .. bx lr).
+CALL_VIA_BASE = 0x08073C40
+
+# libgcc arithmetic helpers agbcc calls for `/` and `%` (retail `_080740B0` is
+# the signed divide that `x / n` compiles to).
+LIBGCC_ADDRS = {
+    "__divsi3": 0x080740B0,
+}
+
+
+def reloc_target_addr(name: str) -> int | None:
+    """ROM address for a Thumb BL reloc symbol (`sub_080…` or `_080…`)."""
+    if name.startswith("sub_"):
+        return addr_from_name(name)
+    if re.fullmatch(r"_[0-9A-Fa-f]{7,8}", name):
+        return int(name[1:], 16)
+    # libgcc interworking thunks (`bx rN; nop`), emitted for indirect calls.
+    if name in LIBGCC_ADDRS:
+        return LIBGCC_ADDRS[name]
+    via = re.fullmatch(r"_call_via_(r\d+|sl|fp|ip|sp|lr)", name)
+    if via:
+        regs = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9",
+                "sl", "fp", "ip", "sp", "lr"]
+        reg = {"r10": "sl", "r11": "fp", "r12": "ip"}.get(via.group(1), via.group(1))
+        return CALL_VIA_BASE + 4 * regs.index(reg)
+    return None
+
+
+def iter_text_relocs(obj_path: Path) -> list[tuple[int, str, str]]:
+    """`(offset, reloc_type, symbol)` for `.rel.text` / `.rela.text`."""
+    result = subprocess.run(
+        ["arm-none-eabi-readelf", "-r", str(obj_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    relocs: list[tuple[int, str, str]] = []
+    in_text = False
+    for line in result.stdout.splitlines():
+        if line.startswith("Relocation section"):
+            in_text = ".rel.text" in line or ".rela.text" in line
+            continue
+        if not in_text:
+            continue
+        if "R_ARM_" not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        rtype = next((p for p in parts if p.startswith("R_ARM_")), "")
+        if not rtype:
+            continue
+        relocs.append((int(parts[0], 16), rtype, parts[-1]))
+    return relocs
+
+
+def abs32_target_addr(name: str) -> int | None:
+    """Linked value for an R_ARM_ABS32 symbol (before in-place addend)."""
+    data = data_symbol_value(name)
+    if data is not None:
+        return data
+    return reloc_target_addr(name)
+
+
+def apply_thm_call_relocs(obj_path: Path, function: str, data: bytes) -> bytes:
+    """Patch unlinked Thumb BL stubs using ROM addresses from symbol names."""
+    base = addr_from_name(function)
+    out = bytearray(data)
+    for off, rtype, target_name in iter_text_relocs(obj_path):
+        if rtype != "R_ARM_THM_CALL":
+            continue
+        target = reloc_target_addr(target_name)
+        if target is None or off + 4 > len(out):
+            continue
+        encoded = encode_thumb_bl(base + off, target)
+        out[off : off + 4] = encoded
+    return bytes(out)
+
+
+def apply_abs32_relocs(obj_path: Path, data: bytes) -> bytes:
+    """Fill unlinked R_ARM_ABS32 pool words for MATCH scoring."""
+    out = bytearray(data)
+    for off, rtype, target_name in iter_text_relocs(obj_path):
+        if rtype != "R_ARM_ABS32" or off + 4 > len(out):
+            continue
+        target = abs32_target_addr(target_name)
+        if target is None:
+            continue
+        addend = int.from_bytes(out[off : off + 4], "little")
+        out[off : off + 4] = (target + addend).to_bytes(4, "little")
+    return bytes(out)
+
+
+def obj_text_bytes(obj_path: Path, function: str | None = None) -> bytes:
+    with tempfile.TemporaryDirectory() as tmp:
+        bin_path = Path(tmp) / "fn.bin"
+        subprocess.run(
+            ["arm-none-eabi-objcopy", "-O", "binary", "-j", ".text", str(obj_path), str(bin_path)],
+            check=True,
+        )
+        data = bin_path.read_bytes()
+    if function:
+        data = apply_thm_call_relocs(obj_path, function, data)
+        data = apply_abs32_relocs(obj_path, data)
+    return data
+
+
+def reference_size(function: str) -> int:
+    for base in (NONMATCH, MATCH):
+        asm = base / f"{function}.s"
+        if not asm.is_file():
+            continue
+        text = asm.read_text()
+        if "incbin" in text:
+            for line in text.splitlines():
+                m = re_incbin(line)
+                if m:
+                    return int(m.group(2), 16)
+        data = asm_text_bytes(asm)
+        if data:
+            return len(data)
+    raise FileNotFoundError(function)
+
+
+def re_incbin(line: str):
+    return re.search(
+        r'\.incbin\s+"baserom\.gba",\s*0x[0-9A-Fa-f]+,\s*(0x[0-9A-Fa-f]+|\d+)',
+        line,
+    )
+
+
+def normalize_compiled(data: bytes, retail_size: int) -> bytes:
+    if len(data) == retail_size:
+        return data
+    if len(data) == retail_size + 2 and data[:retail_size] == data[:retail_size]:
+        tail = data[retail_size:]
+        if tail in (b"\xc0\x46", b"\x00\x00"):
+            return data[:retail_size]
+    return data
+
+
+def _is_addr_word(raw: bytes) -> bool:
+    if len(raw) < 4:
+        return False
+    value = int.from_bytes(raw[:4], "little")
+    if value == 0:
+        return True
+    if value & 3:
+        return False
+    return any(
+        lo <= value < hi
+        for lo, hi in (
+            (0x02000000, 0x02040000),  # EWRAM
+            (0x03000000, 0x03008000),  # IWRAM
+            (0x04000000, 0x04000400),  # I/O
+            (0x05000000, 0x05000400),  # palette RAM
+            (0x06000000, 0x06018000),  # VRAM
+            (0x08000000, 0x0E000000),  # ROM
+            (0x0E000000, 0x0E010000),  # SRAM
+        )
+    )
+
+
+def score_bytes(got: bytes, want: bytes) -> dict[str, Any]:
+    """Byte-match score for compiled .text vs retail.
+
+    Status:
+      matched       — every byte identical (after normalize)
+      identical_diff — same size; remaining diffs are only pool/reloc words
+      same_size     — same size, instruction bytes differ
+      size_mismatch — compiled length != retail
+    """
+    retail_n = len(want)
+    compiled_n = len(got)
+    n = max(retail_n, compiled_n)
+    padded_got = got + b"\x00" * (n - compiled_n)
+    padded_want = want + b"\x00" * (n - retail_n)
+    matched = sum(a == b for a, b in zip(padded_got, padded_want))
+    diff_offs = [i for i, (a, b) in enumerate(zip(padded_got, padded_want)) if a != b]
+    pct = round(100.0 * matched / n, 1) if n else 0.0
+
+    if compiled_n == retail_n and matched == retail_n:
+        kind = "matched"
+    elif compiled_n != retail_n:
+        kind = "size_mismatch"
+    else:
+        words = {off & ~3 for off in diff_offs}
+        pool_only = bool(words) and all(
+            _is_addr_word(padded_want[word : word + 4])
+            and _is_addr_word(padded_got[word : word + 4])
+            and all((off & ~3) in words for off in diff_offs)
+            for word in words
+        )
+        kind = "identical_diff" if pool_only else "same_size"
+
+    return {
+        "matched_bytes": matched,
+        "retail_bytes": retail_n,
+        "compiled_bytes": compiled_n,
+        "pct": pct,
+        "diff_bytes": len(diff_offs),
+        "status": kind,
+        "score": f"{matched}/{retail_n}",
+    }
+
+
+def format_score(info: dict[str, Any]) -> str:
+    return (
+        f"{info['matched_bytes']}/{info['retail_bytes']} bytes matched "
+        f"({info['pct']:.1f}%)  [{info['status']}]"
+    )
+
+
+def first_mismatch(got: bytes, want: bytes) -> int | None:
+    n = min(len(got), len(want))
+    for i in range(n):
+        if got[i] != want[i]:
+            return i
+    if len(got) != len(want):
+        return n
+    return None
+
+
+def format_compact_diff(got: bytes, want: bytes, info: dict[str, Any], context: int = 16) -> str:
+    """Short DIFF for agent packets — no full-function hex dumps."""
+    lines = [
+        "DIFF",
+        format_score(info),
+        f"retail size {len(want)}, compiled size {len(got)}",
+    ]
+    off = first_mismatch(got, want)
+    if off is None:
+        return "\n".join(lines)
+    lines.append(f"first mismatch @ +{off:#x}")
+    start = max(0, off - 4)
+    width = context
+
+    def hx(data: bytes) -> str:
+        chunk = data[start : start + width]
+        return " ".join(f"{b:02x}" for b in chunk)
+
+    lines.append(f"  retail  [{start:#x}]: {hx(want)}")
+    lines.append(f"  compiled[{start:#x}]: {hx(got)}")
+    return "\n".join(lines)
+
+
+def record_score(function: str, info: dict[str, Any], *, note: str = "") -> None:
+    data: dict[str, Any] = {"attempts": {}}
+    if SCORES_JSON.is_file():
+        try:
+            data = json.loads(SCORES_JSON.read_text())
+        except json.JSONDecodeError:
+            data = {"attempts": {}}
+    attempts = data.setdefault("attempts", {})
+    row = dict(info)
+    row["updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if note:
+        row["note"] = note
+    attempts[function] = row
+    SCORES_JSON.parent.mkdir(parents=True, exist_ok=True)
+    SCORES_JSON.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def write_single_function_c(function: str, body: str, out: Path) -> None:
+    # ram_map.h is include-guarded and re-includes global.h, so this
+    # is safe for every function and lets permuter output that references
+    # RAM names integrate without a manual header fix.
+    out.write_text(
+        '#include "global.h"\n'
+        '#include "ram_map.h"\n'
+        '\n'
+        f"// @ {addr_from_name(function):#010x}\n{body}\n"
+    )
+
+
+def compile_and_score(
+    function: str, c_path: Path, *, quiet: bool = True
+) -> tuple[bytes, bytes, dict[str, Any]]:
+    """Compile scratch C and score against retail. Raises on missing asm/tools."""
+    check_semantic_asm(c_path)
+    size = reference_size(function)
+    want = retail_bytes(function, size)
+    with tempfile.TemporaryDirectory() as tmp:
+        obj = Path(tmp) / "scratch.o"
+        compile_c(c_path, obj, quiet=quiet)
+        got = normalize_compiled(obj_text_bytes(obj, function), size)
+    return got, want, score_bytes(got, want)
+
+
+def try_compile_and_score(
+    function: str, c_path: Path
+) -> tuple[bytes, bytes, dict[str, Any]] | None:
+    try:
+        return compile_and_score(function, c_path, quiet=True)
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError, BannedAsmError):
+        return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("function", help="sub_0802B90C")
+    parser.add_argument("c_file", help="scratch .c with the function")
+    parser.add_argument(
+        "--function-only",
+        action="store_true",
+        help="Compile only the named function (temp single-function translation unit)",
+    )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="save byte-match score to docs/decomp-function-scores.json",
+    )
+    parser.add_argument("--note", default="", help="optional note stored with --record")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="print full-function hex unified diff (default: compact first-mismatch)",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="alias for the default compact DIFF (kept for callers)",
+    )
+    args = parser.parse_args()
+
+    if not BASEROM.is_file():
+        print("missing baserom.gba", file=sys.stderr)
+        return 1
+    if not AGBCC.is_file():
+        print("missing agbcc — run build_tools.sh", file=sys.stderr)
+        return 1
+
+    try:
+        size = reference_size(args.function)
+    except FileNotFoundError:
+        print(f"missing asm for {args.function}", file=sys.stderr)
+        return 1
+
+    want = retail_bytes(args.function, size)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        compile_path = Path(args.c_file)
+        if args.function_only:
+            src = Path(args.c_file).read_text()
+            marker = f"{args.function}("
+            if marker not in src:
+                print(f"{args.function} not found in {args.c_file}", file=sys.stderr)
+                return 1
+            compile_path = Path(tmp) / "one.c"
+            compile_path.write_text(src)
+
+        try:
+            check_semantic_asm(compile_path)
+        except BannedAsmError as exc:
+            print(f"BANNED ASM: {exc}", file=sys.stderr)
+            return 2
+
+        obj = Path(tmp) / "scratch.o"
+        compile_c(compile_path, obj)
+        got = normalize_compiled(obj_text_bytes(obj, args.function), size)
+        info = score_bytes(got, want)
+
+        if args.record:
+            record_score(args.function, info, note=args.note)
+
+        if got == want:
+            print("MATCH")
+            print(format_score(info))
+            return 0
+
+        if args.full:
+            print("DIFF")
+            print(format_score(info))
+            print(f"retail size {size}, compiled size {len(got)}")
+            for line in difflib.unified_diff(
+                [want.hex()],
+                [got.hex()],
+                fromfile="retail",
+                tofile="compiled",
+                lineterm="",
+            ):
+                print(line)
+        else:
+            print(format_compact_diff(got, want, info))
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

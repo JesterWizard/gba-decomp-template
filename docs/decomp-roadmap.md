@@ -1,0 +1,294 @@
+# Decompilation roadmap (autonomous)
+
+This is the **master plan** for hands-off progress. The agent follows this
+without waiting for user approval between batches. Escalate only on hard
+blockers (see [AGENTS.md](../AGENTS.md)).
+
+**Start here for the copy-paste mission prompt and fork tree:**
+[decomp-mission.md](decomp-mission.md).
+
+## Current baseline
+
+Run `python3 tools/decomp/report_status.py` for live counts (functions,
+bytes, phase). Phase 1 (link every asm function) and initial Phase 3 (byte-matched
+peel, incl. opcode embeds) are done by the bootstrap; the ongoing work is Phase 3b
+(semantic C conversion — see [decomp-semantic-plan.md](decomp-semantic-plan.md)).
+
+| Metric | Rule |
+|--------|------|
+| `make compare` | Must stay **OK** every batch |
+| ROM layout | Fixed-VMA peel (`asm/rom_layout.ld`) |
+
+---
+
+## Phase 1 — Match ASM (primary loop)
+
+**Goal:** Every `sub_*` from Luvdis is byte-verified and linked via the ROM peel.
+
+### One-shot bootstrap (replaces per-batch asm matching)
+
+```bash
+./init_project.sh                          # header, rom.sha1, scaffold ROM, luvdis → asm/nonmatchings
+python3 tools/decomp/bootstrap_stubs.py    # one byte-exact opcode stub per function
+make compare                               # must print "<FILE_NAME>.gba: OK"
+make analyze && make queue && make scores  # work queue + analysis DB
+```
+
+`bootstrap_stubs.py` writes `asm/matchings/<fn>.s` (sizes for gap peels), `src/matched/<fn>.c`
+(naked `.byte` stub) and an entry in `analysis/matched.json`, then regenerates
+`asm/rom_layout.ld` once. Functions already in the manifest are skipped.
+
+### Matching rules
+
+| Do | Don't |
+|----|-------|
+| Integrate when asm objdump bytes == baserom | Hand-edit `asm/nonmatchings/*.s` |
+| Keep `make compare` green | Commit a change that breaks `make compare` |
+| Prefer asm integration for literal-pool loaders | Force C that doesn't `match_function.py` |
+
+### Exit criteria (Phase 1 done)
+
+- `python3 tools/decomp/report_status.py` → `matching_asm: <total>`
+- `build/matched.json` lists all functions
+- `make compare` OK
+
+**Estimate:** ~60 batches × 10 functions (31 done → ~60 remaining).
+
+---
+
+## Phase 2 — RAM map (parallel, every 3–5 batches)
+
+**Goal:** Document **used vs free** IWRAM/EWRAM; stop hardcoding `0x03…` in new C.
+
+### Each RAM pass
+
+```bash
+python3 tools/scan_ram_literals.py              # human-readable clusters
+python3 tools/scan_ram_literals.py --emit-asm   # refresh pool .inc files
+make compare
+```
+
+### Agent tasks
+
+1. **Rescan** literal pools from `baserom.gba` (never another game's addresses).
+2. **Promote** high-confidence hits from `gUnk_*` in `ram_map_*_pool.inc` to named
+   `SET_DATA` in `asm/ram_map_iwram.s` / `asm/ram_map_ewram.s` when role is clear
+   (e.g. `0x03000264` seen in `sub_0802B90C` → name after tracing).
+3. **Update** `include/ram_map.h` and `docs/ram-map.md` with a used/free table
+   (hardware span, vanilla high-water, safe pool, stack).
+4. **Tighten** `FreeRamSpaceTop` / `FreeEwramSpaceTop` only after scan + margin;
+   keep `.error` guards in `ram_map_iwram.s`.
+
+### RAM map deliverable
+
+`docs/ram-map.md` must contain:
+
+- Occupancy table (USED / SAFE / leave-alone)
+- Named symbols table (growing as functions are understood)
+- Regeneration commands
+
+Phase 2 is **never finished** but should be **non-blocking** for Phase 1 batches.
+
+---
+
+## Phase 3 — ASM → C conversion
+
+**Goal:** Replace `asm/matchings/*.s` with byte-matched C in `src/` where possible.
+
+### When to convert
+
+| Convert to C | Leave as asm |
+|--------------|--------------|
+| `match_function.py` prints `MATCH` | Literal-pool PC-relative loads agbcc won't reproduce |
+| Simple loads/stores once RAM symbols exist | `swi #N` stubs (until syscall wrappers exist) |
+| Struct field access with known types | Hand-written asm (`asm/*.s` trampolines) |
+| Empty returns, trivial getters | `mov pc, lr` and other agbcc mismatches |
+
+### Per-function workflow
+
+```bash
+# 1. Write/refine C (unknown-types.h members, ram_map.h names — no raw 0x03 unless unavoidable)
+# 2. Verify
+python3 tools/decomp/match_function.py sub_XXXXXXXX src/module.c
+# 3. Integrate C into build (future: link src/*.o in peel; today asm stays until C linked)
+# 4. Remove asm/matchings/sub_XXXXXXXX.s only after C is in ROM peel
+make compare
+```
+
+### C rules
+
+- C89 / agbcc only on matching paths
+- Comment header: `// @ 0x080XXXXXX`
+- Struct members in `include/unknown-types.h` (`a->unkA0`), not offset-casts or `asm volatile` — see decomp-mission.md **C style**
+- One file per function in `src/matched/` until Phase 5; then one subsystem per `src/<module>.c`
+- No `static` locals in append code that land in IWRAM `.bss`
+
+### Exit criteria (Phase 3 ongoing)
+
+- Track `% matched asm also has C` in `decomp-status.md`
+- Target: 100% of **convertible** stubs in C; asm-only list documented
+
+---
+
+## Phase 4 — Naming functions
+
+**Goal:** Replace `sub_080XXXXXX` with readable names without breaking matching.
+
+### Mechanism
+
+`<FILE_NAME>.toml`:
+
+```toml
+[renames]
+sub_0802B90C = "GetIwramWord_264"
+sub_080705CC = "SetField19One"
+```
+
+Then:
+
+```bash
+python3 tools/decomp/generate_asm.py --force   # regen labels (do not hand-edit nonmatchings)
+# Update C identifiers + integrator manifest to match
+make compare
+```
+
+### Naming rules
+
+1. Name only after the function's **role** is understood (not just "it's a stub").
+2. Prefix by subsystem: `Menu`, `Save`, `Sound`, etc. when known.
+3. One rename per commit batch max when it touches many call sites (avoid churn).
+4. Keep ROM symbol = C name = asm label after rename regen.
+
+### Exit criteria
+
+- `[renames]` covers all matched functions
+- `src/` and headers use descriptive names; `sub_*` only in generated asm until regen
+
+---
+
+## Phase 5 — Shiftable ROM
+
+**Goal:** Retail image is built from **relocatable** linked objects, not hundreds of
+fixed-VMA `.rom_sub_*` sections — so future code/data can be inserted without
+manual address surgery.
+
+### Why we're not shiftable yet
+
+`make` now compiles `src/matched/*.c` into a sequential peel (`compile_matched.py`
++ `.rom_body : SUBALIGN(2)`). Head stays at `0x08000000`. Function/gap VMAs are
+gone. Thumb function-entry words, `gData_*` tables, pointer-table runs, labeled
+refs, and sparse leftover data pointers in peels are `.4byte`. ROM `gData_*`
+are peel labels (`SET_ROM_DATA`). Matched C keeps live BL / ABS32 relocs.
+`make GROW=1` keeps a non-retail `.text` size so later objects slide. Remaining:
+dense/unaligned singleton `0x08……` words (graphics-like).
+
+### Migration gates (start Phase 5 when ANY is true)
+
+- [x] ≥ **80%** functions matched (all functions semantic C)
+- [ ] Largest unmatched incbin gap **< 4 KiB**
+- [x] User requests hack/append feature that needs insertable ROM
+
+### Migration steps
+
+0. **Link matched C** — compile `src/matched/*.c` (`compile_matched.py`). **Done.**
+1. **Contiguous grouping** — adjacent functions sit next to each other in `.rom_body`. **Done** (one output section; still one `.o` per function).
+2. **Sequential linker script** — `rom.s` → matched `.text` → gap incbins → tail. **Done.**
+3. **Remove** per-function `0x08……` assignments from `rom_layout.ld`. **Done** (head only).
+4. **Audit** hardcoded ROM pointers in C/asm/data → replace with symbols / linker labels.
+   Thumb function-entry words and known `gData_*` table words in peels: **Done**.
+   Matched C BLs / `gData_*` pools: **Done** (live `.rel.text`). Pointer tables
+   (runs of ≥2 ROM words) and labeled singleton refs in peels: **Done**.
+   Unlabeled dense/unaligned singleton data-to-data words still absolute.
+5. **`tools/decomp/check_shiftable.py`**: sequential layout + peel pointer/label
+   gates + unmatched `sub_*` + data-pointer tables. **Done.**
+6. **Slide-and-rebuild** (`make shift-test`, `ROM_BASE + 0x1000` after `.rom_head`).
+   **Done.**
+7. **Grow a function** (`make grow-test` + `GROW=1`): later peels slide when
+   matched `.text` grows. Sparse leftover data pointers are `.4byte`.
+   **Done.** Remaining: ~3,791 dense/unaligned singleton `0x08……` words
+   (graphics-like; converting them would slide pixel values).
+
+### Handwritten asm
+
+These stay **outside** the shiftable C pool forever (unless rewritten deliberately):
+
+- `asm/ram_map*.s`
+- Future trampolines in `asm/*.s`
+
+### Exit criteria (Phase 5 done)
+
+- `check_shiftable.py` passes
+- `make compare` OK
+- New matched code added by editing `src/` + shrinking one incbin, not adding ld VMA lines
+- Documentation updated in this file + `docs/architecture.md`
+
+---
+
+## Commit policy
+
+**The agent commits after every successful `match_batch.sh` without asking.**
+
+### Pre-commit checklist
+
+- [ ] `make compare` → `<FILE_NAME>.gba: OK`
+- [ ] Only intended files staged (no `baserom.gba`, `*.gba`, `build/`)
+
+### Commit message format
+
+```
+decomp: match batch N (+10 functions, M/TOTAL total)
+
+Integrate sub_080…, sub_080…, …
+make compare: OK
+```
+
+### Typical staged paths
+
+- `asm/matchings/*.s`
+- `asm/rom.s`, `asm/rom_tail.s`, `asm/rom_gap_*.s`
+- `asm/rom_layout.ld`
+- `build/matched.json`
+- `src/*.c`, `include/*.h` (when C lands)
+- `src/decompiled/` (when parking unmatched C)
+- `<FILE_NAME>.toml` (renames)
+- `docs/decomp-status.md`, `docs/ram-map.md`, `docs/decomp-wip.md`
+
+### When NOT to commit
+
+- `make compare` failed (fix or revert integration)
+- Batch partially applied (< 10) due to verify failures — commit only if user asked; default: fix or skip failed fns and still commit if compare OK with fewer than 10
+
+---
+
+## Agent session checklist (no user approval)
+
+```
+1. python3 tools/decomp/report_status.py
+2. tools/decomp/match_batch.sh 10
+3. [every 3rd batch] python3 tools/scan_ram_literals.py --emit-asm && update ram-map.md
+4. [when MATCH] convert 1–3 functions to C + match_function.py
+5. [when role known] add rename to <FILE_NAME>.toml
+6. Report summary (template in AGENTS.md)
+7. If Phase 5 gates met → begin shiftable migration branch
+```
+
+---
+
+## Timeline (rough)
+
+| Phase | Trigger | Effort |
+|-------|---------|--------|
+| 1 ASM match | Now | ~60 batches |
+| 2 RAM map | Every 3–5 batches | Ongoing |
+| 3 C conversion | After RAM names for literals | Ongoing from batch ~10 |
+| 4 Naming | As roles understood | Ongoing |
+| 5 Shiftable | ≥80% matched | 1–2 focused sessions |
+
+---
+
+## References
+
+- [decomp-status.md](decomp-status.md) — live log
+- [decomp-wip.md](decomp-wip.md) — parked unmatched C
+- [ram-map.md](ram-map.md) — IWRAM/EWRAM occupancy
+- [docs/architecture.md](../docs/architecture.md) — matching vs hacking

@@ -1,0 +1,194 @@
+# Autonomous decompilation mission
+
+**Copy-paste this block to start (or resume) a hands-off agent session:**
+
+```text
+Autonomous decomp mission — do not stop for approval between batches.
+
+Do not re-read decomp-mission.md / roadmap. Start with scripts.
+
+Goal: byte-matching C for every function, evidenced names for all of them,
+make compare always OK. Progress on naming is NOT gated on progress on bytes.
+
+Each session until done:
+1. python3 tools/decomp/report_status.py && make compare
+2. python3 tools/decomp/script_first.py
+3. python3 tools/decomp/agent_packet.py --next   # one leftover function; max 1 retry then park
+4. Naming batch: read analysis/functions.json + structs.json, then
+   tools/decomp/symbols.py set ... / apply / generate
+5. Every 3–5 batches: tools/decomp/ram_map_pass.sh, then make analyze
+6. Update docs/decomp-status.md
+7. Commit after each green batch (see Commit policy)
+
+Escalate only: baserom missing, agbcc broken, make compare fails after 3 fix attempts.
+Never launch long permuter runs or hand-chase register order — see docs/lessons/workflow.md.
+
+Do not stop until every function has src/matched/*.c OR is documented asm-only with
+reason, and every function has a symbols.json entry (or a recorded reason it has none).
+```
+
+---
+
+## Definition of done
+
+| Layer | Criterion | Current tooling |
+|-------|-----------|-----------------|
+| **ROM linked** | every function in the peel; `make compare` OK | `bootstrap_stubs.py`, `integrate_c.py` |
+| **Analysis DB** | `analysis/*.json` complete and idempotent | `analyze.py`, `make analyze` |
+| **C decomp** | Every *convertible* function has verified C in `src/matched/` | `script_first.py`, `match_function.py`, `integrate_c.py` |
+| **Drafts** | Unmatched C parked in `src/decompiled/` (DECOMPILED tier), indexed | `park_wip.py` |
+| **RAM map** | Hot IWRAM/EWRAM named; pool rescanned periodically | `ram_map_pass.sh`, `scan_ram_literals.py` |
+| **Names** | Every function has an evidenced `analysis/symbols.json` entry | `symbols.py`, [decomp-pipeline.md](decomp-pipeline.md) |
+| **Docs** | `docs/systems/` and `docs/functions/` regenerate clean | `document.py`, `make document` |
+| **Shiftable** | No fixed-VMA per-function sections (Phase 5) | `check_shiftable.py` |
+
+**Asm-only is acceptable** for functions that cannot byte-match in agbcc (literal-pool PC-relative loads, permuter-hard stubs). List them in `docs/decomp-status.md` under **Asm-only (documented)** with the blocker reason.
+
+---
+
+## Session loop (current phase: 3b → 4)
+
+Phase 1 (`bootstrap_stubs.py`) places a byte-matched C stub for every function; **they start as opcode embeds** (`asm(".byte …")`). **Phase 3b** replaces those with semantic C.
+
+Pipeline stages and the lifecycle vocabulary are documented in
+[decomp-pipeline.md](decomp-pipeline.md). Read that before touching
+`analysis/` or `symbols.json`.
+
+Default loop:
+
+```bash
+# 1. Status gate
+python3 tools/decomp/report_status.py
+make compare
+
+# 2. Deterministic convert (patterns + cleaned m2c)
+python3 tools/decomp/script_first.py
+
+# 3. Remainder — one packet, not a doc dump
+python3 tools/decomp/agent_packet.py --next
+# Write C from that packet only. One match_function.py attempt, then park_wip.py.
+
+# 4. Report
+python3 tools/decomp/report_status.py
+```
+
+---
+
+## Fork policy
+
+When multiple approaches exist, try in this order. **Never break `make compare`.**
+
+```
+┌─ script_first.py / c_patterns MATCH?
+│    YES → already integrated (or try_convert.py --integrate)
+│    NO  ↓
+├─ agent_packet.py seed + hand-refined C (max 1 retry)?
+│    match_function.py → MATCH → integrate_c.py
+│    DIFF → permuter (same-size); still DIFF ↓
+├─ Literal-pool / agbcc ordering mismatch?
+│    Keep asm matching in `src/matched/`; **park** unmatched C in `src/decompiled/`
+│    (see docs/decomp-wip.md). Do not revert a reconstruction without a seed.
+└─ ≥80% in C + check_shiftable gates met?
+     Begin Phase 5 shiftable ROM migration (see decomp-roadmap.md)
+```
+
+### Subsystem order (suggested)
+
+Pick the subsystem with the most shared RAM (`analysis/systems.json`, `docs/ram-map.md`) and finish it before moving on; callers and callees then share types. Typical order: core engine helpers (heap, math, string, palette), save, then the biggest gameplay subsystem, then the long tail by size + call graph.
+
+Naming is a separate pass (`symbols.py`). It is not part of a match batch.
+
+---
+
+## C style (default)
+
+Follow the pret/aw2bhr matching style. New semantic C must compile with agbcc and `match_function.py` → MATCH.
+
+| Do | Don't |
+|----|--------|
+| `a->unkA0 = v` on a growing struct in `include/unknown-types.h` | `*(u16 *)((u8 *)a + 0xa0) = v` |
+| `gWorkPtr->unk1800 = v` (typed macro in `ram_map.h`) | `*(u32 *)((u8 *)*(u32 **)0x03000198 + 0x1800) = v` |
+| `filler_XX` for unread bytes; `unkXX` for accessed fields | Per-file `void *` + ad-hoc offsets |
+| `asm("swi 5");` for BIOS (only allowed inline asm in semantic C) | `register`, empty `asm("")`, or `asm volatile` to force registers |
+| Add a field to a struct (superset) | Move a field or change its type without re-matching every user |
+
+- Structs are a **superset**: adding a field is fine; moving one is not. Offsets and sizeof are load-bearing.
+- `volatile` on a store only when the ROM kept extra narrowing (`lsl #24; lsr #24` before `strb`).
+- Naked `.byte` / unified `asm(...)` is for documented opcode stubs, not new C.
+- `include/unknown-functions.h` gets prototypes when one `sub_*` needs to call another.
+- Keep per-function `src/matched/*.c` until Phase 5 (do not pack consecutive functions into one file yet).
+
+`c_patterns.py` emits member stores against `struct Unk*` names from `tools/decomp/unknown_types.py`. If a new offset appears, add the field (split a `filler_`) in `unknown-types.h` before integrating.
+
+---
+
+## Commit policy
+
+Per [CLAUDE.md](../CLAUDE.md): **commit only when the user asks**; never with a failing `make compare`.
+
+Pre-commit checklist:
+
+- [ ] `make compare` → `<FILE_NAME>.gba: OK`
+- [ ] No `baserom.gba`, `*.gba`, or accidental `build/` artifacts staged
+
+Message formats:
+
+```
+decomp: C batch (+N functions, M/TOTAL in src/matched)
+
+sub_080…, sub_080…
+make compare: OK
+```
+
+```
+decomp: <subsystem> RAM names + N C functions
+
+make compare: OK
+```
+
+```
+decomp: naming batch (subsystem Xyz, +N named)
+
+symbols.json = source of truth; include/symbols.h + [renames] regenerated
+make compare: OK
+```
+
+If the user has not asked for commits, report the batch at end of session instead.
+
+---
+
+## Escalation (ask the user)
+
+- `baserom.gba` missing or wrong SHA1
+- `build_tools.sh` / agbcc build fails after retry
+- `make compare` still fails after **3** distinct fix attempts (attach log + diff)
+
+---
+
+## Key paths
+
+| What | Where |
+|------|-------|
+| End-to-end process | [README.md](../README.md) § Decompilation |
+| Mission (this file) | `docs/decomp-mission.md` |
+| Script-first batch | `tools/decomp/script_first.py` |
+| Function packet | `tools/decomp/agent_packet.py` |
+| Master plan | `docs/decomp-roadmap.md` |
+| Live log | `docs/decomp-status.md` |
+| Pipeline / lifecycle | [decomp-pipeline.md](decomp-pipeline.md) |
+| Parked unmatched C | `docs/decomp-wip.md`, `src/decompiled/` |
+| Analysis database | `analysis/*.json`, `tools/decomp/analyze.py` |
+| Symbol names | `analysis/symbols.json`, `tools/decomp/symbols.py` |
+| Generated docs | `docs/systems/`, `docs/functions/` |
+| C-vs-original counter | `docs/decomp-progress.json` / `decomp-progress.svg` |
+| Matched C | `src/matched/*.c` |
+| Types | `include/unknown-types.h`, `include/unknown-functions.h` |
+| Manifest | `analysis/matched.json` (tracked — not under build/) |
+| Renames (generated view) | `<FILE_NAME>.toml` `[renames]` |
+
+---
+
+## Progress snapshot
+
+Live counts: `python3 tools/decomp/report_status.py` (or `progress.py`).
+Update `decomp-status.md` after each batch; don't hand-copy numbers here.
