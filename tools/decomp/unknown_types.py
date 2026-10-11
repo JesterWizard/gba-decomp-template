@@ -15,22 +15,9 @@ HEADER = ROOT / "include" / "unknown-types.h"
 BEGIN = "/* BEGIN GENERATED STRUCTS */"
 END = "/* END GENERATED STRUCTS */"
 
-# Functions known to share a layout (hand-merged in unknown-types.h).
-SHARED_STRUCT = {
-    "sub_08068584": "Unk68574",
-    "sub_08068574": "Unk68574",
-    "sub_080358CC": "Unk35878",
-    "sub_08035878": "Unk35878",
-    "sub_080705D4": "Unk705CC",
-    "sub_080705CC": "Unk705CC",
-    "sub_080338E4": "Unk338E4",
-    "sub_080346A8": "Unk346A8",
-    "sub_08036190": "Unk36190",
-    "sub_0806BB38": "Unk6BB38",
-    "sub_08062098": "Unk62098",
-    "sub_080314FC": "BattleWork",
-    "sub_080628E4": "MainWork",
-}
+# Functions known to share a layout (hand-merged in unknown-types.h), e.g.
+# {"sub_08001234": "UnkSharedObj", "sub_08001240": "UnkSharedObj"}. Fill in per game.
+SHARED_STRUCT: dict[str, str] = {}
 
 _FIELD_RE = re.compile(
     r"/\*\s*([0-9a-fA-F]+)\s*\*/\s*(u8|u16|u32|s8|s16|s32|void\s*\*)\s+(unk[0-9A-Fa-f]+|filler_[0-9A-Fa-f]+)(\[[^\]]+\])?"

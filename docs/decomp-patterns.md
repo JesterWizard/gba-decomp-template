@@ -57,8 +57,7 @@ These are tried first by `try_convert.py` and `script_first.py`.
 | Store three u16 | three consecutive `strh` | `unkXX` halfwords |
 | Init six-word | stores `0x7800`, `0x5000` | common struct init |
 | Indexed offset | `ldrb unk06; lsl; add unk10` | `(u8*)a + (idx<<bit) + off` |
-| IWRAM addend ldrb | pool + add + ldrb | battle lookup byte |
-| Main-work table | `gMainWorkPtr` + ROM table | `row[gMainWorkPtr->unk1818][idx]` |
+| IWRAM addend ldrb | pool + add + ldrb | global pointer + offset byte |
 
 Before integrating a new offset: add the field to a struct in `include/unknown-types.h` (split a `filler_`).
 

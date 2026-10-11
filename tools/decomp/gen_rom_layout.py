@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fnfiles  # noqa: E402
 from fnfiles import stem_for   # noqa: E402
+import libgcc  # noqa: E402
 
 BASEROM = ROOT / "baserom.gba"
 MANIFEST = ROOT / "analysis" / "matched.json"
@@ -62,11 +63,6 @@ def rom_data_symbols() -> dict[int, str]:
 
 UNKNOWN_FNS = ROOT / "include" / "unknown-functions.h"
 THUNK_RE = re.compile(r"\b(_08[0-9A-Fa-f]{6})\b")
-CALL_VIA_BASE = 0x08073C40
-CALL_VIA_REGS = [
-    "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9",
-    "sl", "fp", "ip", "sp", "lr",
-]
 
 
 def thunk_labels() -> dict[int, list[str]]:
@@ -80,10 +76,14 @@ def thunk_labels() -> dict[int, list[str]]:
         if name not in names:
             names.append(name)
 
-    for i, reg in enumerate(CALL_VIA_REGS):
-        add(CALL_VIA_BASE + 4 * i, f"_call_via_{reg}")
-    add(0x080740B0, "__divsi3")
-    add(0x080740B0, "_080740B0")
+    for reg in libgcc.CALL_VIA_REGS:
+        addr = libgcc.call_via_addr(reg)
+        if addr is not None:
+            add(addr, f"_call_via_{reg}")
+    divsi3 = libgcc.divsi3_addr()
+    if divsi3 is not None:
+        add(divsi3, "__divsi3")
+        add(divsi3, f"_{divsi3:08X}")
     if UNKNOWN_FNS.is_file():
         for name in sorted(set(THUNK_RE.findall(UNKNOWN_FNS.read_text()))):
             add(int(name[1:], 16), name)

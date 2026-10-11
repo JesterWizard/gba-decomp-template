@@ -43,7 +43,7 @@ If a readable seed DIFFs, **do not** replace it with register/goto mimicry. Run
 `src/matched/` and park the semantic seed.
 
 **Example (good):** `sub_08040EF4` — walk `struct Unk40EF4 *entry`, compare `unk00`,
-index `((u32 *)entry->unk04)[gMainWorkPtr->unk1818]`.
+index `((u32 *)entry->unk04)[gGameState->mode]`.
 
 **Example (bad):** same function with `r5`/`r3`/`loop:`/`goto advance` copied from objdump.
 

@@ -16,7 +16,7 @@ Membership is decided in two passes:
 
   python3 tools/decomp/systems.py            # membership summary
   python3 tools/decomp/systems.py --json
-  python3 tools/decomp/systems.py --system battle
+  python3 tools/decomp/systems.py --system graphics
 """
 
 from __future__ import annotations
@@ -45,17 +45,13 @@ SYSTEM_RANGES: dict[str, list[tuple[int, int]]] = {
 
 #: Global roots referenced by most functions. They identify no subsystem, so
 #: they are excluded from evidence (see the `notes` block in systems.json).
-UNIVERSAL_SYMBOLS: tuple[str, ...] = ("gMainWorkPtr", "gMainWork")
+#: Fill in your game's root pointers once they are named (e.g. "gMainWorkPtr").
+UNIVERSAL_SYMBOLS: tuple[str, ...] = ()
 
-#: Named RAM symbols that imply a subsystem, from `asm/ram_map_*.s`.
-#: `gMainWorkPtr` is deliberately absent: it is the global root every function
-#: reaches through, so it identifies nothing.
+#: Named RAM symbols that imply a subsystem, from `asm/ram_map_*.s`. Add your game's
+#: subsystem roots here (e.g. "battle": ("gBattle",)). Global roots that every
+#: function reaches through identify nothing; list them in UNIVERSAL_SYMBOLS instead.
 SYSTEM_SYMBOLS: dict[str, tuple[str, ...]] = {
-    "battle": (
-        "gBattleWork",
-        "gBtl",
-        "gBattlerArena",
-    ),
     "save": ("Flash", "Sram", "SRAM"),
 }
 
@@ -240,7 +236,7 @@ def build(
         "notes": {
             "universal_symbols_excluded": list(UNIVERSAL_SYMBOLS),
             "why": (
-                "Global roots such as gMainWorkPtr are referenced by most functions, "
+                "Global root pointers are referenced by most functions, "
                 "so treating them as subsystem evidence inflates membership. "
                 "Only subsystem-specific symbols assign a system."
             ),

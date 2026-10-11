@@ -1,7 +1,7 @@
 # agbcc matching tricks
 
-Codegen tells that pointed to the right C, collected over ~100 hard functions in the
-Beyblade G Revolution decomp (function names/addresses below are that project's, kept
+Codegen tells that pointed to the right C, collected over ~100 hard functions in a
+previous complete GBA decomp (function names/addresses below are that project's, kept
 as worked examples). **Read this before spending time on a same-size or size DIFF.**
 Append new entries as you learn them: symptom → cause → the C that fixed it.
 
@@ -10,7 +10,7 @@ Learned while matching size-DIFF / WIP functions (2026-09-27):
 - **Default to data symbols.** Retail used real symbols for globals and ROM tables. A `*(T **)0x0300xxxx` macro or `(T *)0x08xxxxxx` literal changes pool sharing, constant folding (`base+0x80` folded into one literal) and reload/CSE behaviour. Add `SET_DATA gData_X` in `asm/data_symbols.s` plus an extern in `data_symbols.h`. This alone fixed sub_080474AC, sub_0802FA94, sub_08033188, sub_08045D3C and sub_08035D68.
 - A global pointer that is not reloaded after a u16/u32 struct store (but is reloaded after a u8 store) is a scalar symbol (`extern T *gData_X;`), not `gData_X[0]`.
 - A table base kept as `base + 0x18` across a loop is a typed struct-array symbol, not a u8 array cast.
-- `_08073C40/44/48/4C` are libgcc `_call_via_r0..r3` thunks. Write the source as a function-pointer call (`((void (*)(T *))p->cb)(a)`) and let the compiler choose the register.
+- `bl _call_via_r0..r3` (libgcc `bx rN; nop` thunks, located automatically in the baserom) is an indirect call. Write the source as a function-pointer call (`((void (*)(T *))p->cb)(a)`) and let the compiler choose the register.
 - Stack param loaded at entry with no truncation, only used as `x & 3`: it is a `u8` param.
 - `muls` by a constant materialized after a call: the constant came from a local variable.
 - A grouped `(expr | CONST)` or `(a - 1) + b` that agbcc re-associates can be pinned with an inline assignment `(t = expr | CONST)`.
@@ -24,7 +24,7 @@ Learned while matching size-DIFF / WIP functions (2026-09-27):
 - A missing `return` on one path (retail UB) can be the match: sub_080739E8 returns the NULL arg by falling off the end.
 - `-O1` functions (EEPROM code, sub_08067504/sub_08067584): the permuter's compile.sh ignores `-O1`; add it by hand in nonmatchings/<fn>/compile.sh and run tools/decomp-permuter/permuter.py directly.
 
-- `x / n` compiles to `bl __divsi3`; match_function.py now maps it to retail `_080740B0`, so plain `/` matches (sub_08072A38).
+- `x / n` compiles to `bl __divsi3`. Set `DIVSI3_ADDR` in `project.mk` to your ROM's `__divsi3` (the `bl` target of a known signed divide) and match_function.py maps the call to it, so plain `/` matches.
 - Retail loading a mask constant into a register before the load (`movs r4,#0x1F; ands r4,r1`) = constant in a local: `r = 0x1F; r &= color;`.
 - Duplicated param copies (arg kept in a reg and on the stack) mean two locals: `e1 = e; e2 = e;` one per call site (sub_08069270, still unmatched).
 - Typed prototypes (u16/u8 params, struct pointers) instead of `void *`/u32 + local copies often fix param register order; check callers still match.
@@ -119,7 +119,7 @@ Added 2026-10-01 (sub_08067CE8 / AnimObjDraw matched, 548/548):
 - **`m3` mask var only where retail needs it**: first AND terms use literal `& 3` (cse shares the const pseudo, giving `mov r2,r8; ands r2,r3` operand order); `m3 = 3` inline in the *third* term only (`(a->unk39 & (m3 = 3))`) keeps the later `(s8)x & m3` sext. Inline in the first term gives `[unk38, tmp]` operand order instead.
 - A lone global/field address pseudo (`a->unkB8` slot ptr, `&a->unk31`) needs no explicit local: cse shares `a+const` addresses; naming `fp`/`slot` locals changed the code.
 
-Added 2026-10-01 (sub_08044648 / BeybladeSpawnList matched, 364/364, ~10 min):
+Added 2026-10-01 (sub_08044648, a spawn-list loader, matched 364/364, ~10 min):
 - Recipe that solved it immediately: `/* match-compiler: old_agbcc */` + `s16 key = *ids` local reused by both GetIndexedRecordWord calls + `tbl = gData_X; def = &tbl[id];` (table-base-first). agbcc (new) was same-size but never reached it; old_agbcc dupes the loop-test load unless `key` exists. Try this trio first on any "table base before id*size" draft.
 
 Added 2026-10-01 (sub_080618EC / TextTypewriterTick parked at 375/428, not matched):

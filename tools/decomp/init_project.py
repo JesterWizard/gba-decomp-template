@@ -56,6 +56,10 @@ def main() -> int:
         f"GAME_CODE  := {code}\n"
         f"MAKER_CODE := {maker}\n"
         f"REVISION   := {rev}\n"
+        "\n"
+        "# Optional: ROM address of libgcc __divsi3 (the `bl` target of a signed `x / n`).\n"
+        "# `_call_via_rN` thunks are found in the baserom automatically (tools/decomp/libgcc.py).\n"
+        "DIVSI3_ADDR :=\n"
     )
     sha = hashlib.sha1(data).hexdigest()
     (ROOT / "rom.sha1").write_text(f"{sha}  {name}.gba\n")

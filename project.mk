@@ -12,3 +12,7 @@ TITLE      := MYGAME
 GAME_CODE  := ABCE
 MAKER_CODE := 01
 REVISION   := 0
+
+# Optional: ROM address of libgcc __divsi3 (the `bl` target of a signed `x / n`).
+# `_call_via_rN` thunks are found in the baserom automatically (tools/decomp/libgcc.py).
+DIVSI3_ADDR :=

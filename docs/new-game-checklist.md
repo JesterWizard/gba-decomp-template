@@ -1,9 +1,9 @@
 # New game checklist
 
 From an empty clone to the first semantic-C batch. Everything below is verified: the
-day-zero path (header → scaffold ROM → 633 opcode stubs → `make compare OK` → one
-`script_first.py` MATCH integrated) was smoke-tested on the Beyblade G Revolution ROM
-before this template was cut.
+day-zero path (header → scaffold ROM → one opcode stub per function →
+`make compare OK` → one `script_first.py` MATCH integrated) was smoke-tested on a real
+ROM before this template was cut.
 
 ## 0. Prerequisites
 
@@ -54,6 +54,7 @@ fields to `include/unknown-types.h`, and named RAM/ROM symbols.
 | Group rules | `GROUPS` in `tools/decomp/groups.py` | name-prefix → `src/<group>.c`; start empty, add as names appear |
 | Name vocabulary | `docs/decomp-pipeline.md` § Vocabulary | use the game's own words; evidence-backed |
 | ROM size / layout | automatic from baserom size | 4/8/16/32 MB all handled by `gen_rom_layout.py` |
+| libgcc helpers | `DIVSI3_ADDR` in `project.mk` | `_call_via_rN` thunks are found automatically; set `__divsi3` once you see the `bl` target of a signed divide (`python3 tools/decomp/libgcc.py` prints both) |
 | Engine/library functions | `docs/lessons/` | Recognise Nintendo/Gax/EEPROM/Flash libs early; they are matchable with known sources |
 
 ## 4. Compiler
@@ -76,4 +77,4 @@ See `CLAUDE.md`. Short form: `report_status.py` → `make compare` → `script_f
 - A fresh clone needs `bash build_tools.sh` and `generate_asm.py` (nonmatchings are
   git-ignored) before `script_first.py` has targets; `make` itself works from tracked files.
 - Mods/hooks (`mods/`, `tools/mod/`, `tools/gfx/`) were deliberately **not** carried over;
-  they are a separate layer built on a finished decomp. See the Beyblade repo for the design.
+  they are a separate layer built on a finished decomp.

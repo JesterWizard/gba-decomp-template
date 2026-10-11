@@ -122,7 +122,7 @@ beat names inferred from a prefix that was already there.
   (`Unk84FindIndexByKey`) — the number should identify *where the data is*, not how
   wide a record is, or it cannot be looked up later.
 - Name the **type** even when the address must stay a literal
-  (`struct BeybladeDef`, not `struct Unk75AB8`). A ROM table usually cannot be
+  (`struct UnitDef`, not `struct Unk75AB8`). A ROM table usually cannot be
   converted to a data symbol without changing codegen — see the note at the top of
   `asm/data_symbols.s` — but the struct costs nothing and carries the meaning.
 - Prefer what the caller *does* with a value over what the code looks like. The

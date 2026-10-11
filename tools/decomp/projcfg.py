@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-_LINE = re.compile(r"^([A-Z_]+)\s*:?=\s*(.*?)\s*$")
+_LINE = re.compile(r"^([A-Z][A-Z0-9_]*)\s*:?=\s*(.*?)\s*$")
 
 
 def _load() -> dict[str, str]:

@@ -42,6 +42,7 @@ CPPFLAGS = [
 
 sys.path.insert(0, str(ROOT / "tools" / "decomp"))
 from asm_bytes import addr_from_name, asm_text_bytes, retail_bytes  # noqa: E402
+import libgcc  # noqa: E402
 
 # Per-function agbcc flags, parsed from `/* match-flags: ... */` in the C file.
 # gcc -E strips comments, so these are read from the original .c (not the .i).
@@ -280,31 +281,19 @@ def encode_thumb_bl(from_addr: int, to_addr: int) -> bytes:
     return hw1.to_bytes(2, "little") + hw2.to_bytes(2, "little")
 
 
-# ROM address of libgcc `_call_via_r0` (0x08073C40..0x08073C77: bx r0 .. bx lr).
-CALL_VIA_BASE = 0x08073C40
-
-# libgcc arithmetic helpers agbcc calls for `/` and `%` (retail `_080740B0` is
-# the signed divide that `x / n` compiles to).
-LIBGCC_ADDRS = {
-    "__divsi3": 0x080740B0,
-}
-
-
 def reloc_target_addr(name: str) -> int | None:
     """ROM address for a Thumb BL reloc symbol (`sub_080…` or `_080…`)."""
     if name.startswith("sub_"):
         return addr_from_name(name)
     if re.fullmatch(r"_[0-9A-Fa-f]{7,8}", name):
         return int(name[1:], 16)
+    # libgcc signed divide; its address is per game (DIVSI3_ADDR in project.mk).
+    if name == "__divsi3":
+        return libgcc.divsi3_addr()
     # libgcc interworking thunks (`bx rN; nop`), emitted for indirect calls.
-    if name in LIBGCC_ADDRS:
-        return LIBGCC_ADDRS[name]
     via = re.fullmatch(r"_call_via_(r\d+|sl|fp|ip|sp|lr)", name)
     if via:
-        regs = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9",
-                "sl", "fp", "ip", "sp", "lr"]
-        reg = {"r10": "sl", "r11": "fp", "r12": "ip"}.get(via.group(1), via.group(1))
-        return CALL_VIA_BASE + 4 * regs.index(reg)
+        return libgcc.call_via_addr(via.group(1))
     return None
 
 

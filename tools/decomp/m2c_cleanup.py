@@ -66,7 +66,7 @@ def _prefer_name(old: str | None, new: str) -> str:
         return new
     if new_unk and not old_unk:
         return old
-    # Prefer shorter named symbols (gBattleWork over gBattleWorkPtrLoc noise)
+    # Prefer shorter named symbols (gFoo over gFooPtrLoc noise)
     if len(new) < len(old):
         return new
     return old

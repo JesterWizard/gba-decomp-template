@@ -4,7 +4,7 @@
 Use after picking a target from docs/decomp-queue.md.
 
   python3 tools/decomp/try_convert.py sub_08034894
-  python3 tools/decomp/try_convert.py sub_08034894 --integrate --note battle/input
+  python3 tools/decomp/try_convert.py sub_08034894 --integrate --note input
   python3 tools/decomp/try_convert.py sub_08034894 --write scratch.c
 """
 

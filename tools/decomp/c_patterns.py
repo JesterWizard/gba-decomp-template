@@ -154,12 +154,7 @@ PATTERN_CATALOG: list[dict[str, str]] = [
     {
         "id": "iwram-addend-ldrb",
         "note": "iwram ptr + addend ldrb",
-        "summary": "*(u8*)(addend + *gUnk_03……) — battle lookup style",
-    },
-    {
-        "id": "main-work-table",
-        "note": "main-work table lookup",
-        "summary": "ROM table indexed by gMainWorkPtr->unk1818 then arg",
+        "summary": "*(u8*)(addend + *gUnk_03……) — global pointer lookup",
     },
 ]
 
@@ -511,36 +506,6 @@ def guess_c(function: str, asm_lines: list[str]) -> CCandidate | None:
             f"u8 {function}(void)\n{{\n"
             f"    return *(u8 *)({addend} + *(u32 *){_pool_sym(ptr)});\n}}",
             "iwram ptr + addend ldrb",
-        )
-
-    # ROM table indexed by main-work byte @ +0x1818, then by arg (battle table lookup).
-    m = re.search(
-        rf"{function}:\n"
-        rf"\tldr r2, _[0-9A-Fa-f]+ @ =(0x[0-9A-Fa-f]+)\n"
-        rf"\tldr r1, _[0-9A-Fa-f]+ @ =(0x03000198)\n"
-        rf"\tldr r1, \[r1, #0x00\]\n"
-        rf"\tldr r3, _[0-9A-Fa-f]+ @ =(0x00001818)\n"
-        rf"\tadds r1, r1, r3\n"
-        rf"\tldrb r1, \[r1, #0x00\]\n"
-        rf"\tlsls r1, r1, #0x02\n"
-        rf"\tadds r1, r1, r2\n"
-        rf"\tldr r1, \[r1, #0x00\]\n"
-        rf"\tlsls r0, r0, #0x02\n"
-        rf"\tadds r0, r0, r1\n"
-        rf"\tldr r0, \[r0, #0x00\]\n"
-        rf"\tbx lr",
-        blob,
-    )
-    if m:
-        table = m.group(1)
-        return CCandidate(
-            f"u32 {function}(u32 idx)\n{{\n"
-            f"    u32 **tables;\n"
-            f"    u32 *row;\n"
-            f"    tables = (u32 **){table};\n"
-            f"    row = tables[gMainWorkPtr->unk1818];\n"
-            f"    return row[idx];\n}}",
-            f"main-work table lookup {table}",
         )
 
     return None

@@ -36,13 +36,11 @@ def accumulate(e, base: int, buf: bytearray) -> None:
                     buf[o + k] = 1
 
 
-# Allocator state (HeapAlloc sub_0806A3A4 / FastAllocate sub_0806A314). Both keep a
-# list of address-ordered nodes {+0 start, +4 size, +8 prev, +C next} and place
-# blocks first-fit from the bottom, so the end of the last node is the footprint.
-HEAPS = {
-    "main": {"head": 0x03000B30, "start": 0x02000800, "len": 0xFE << 10},
-    "fast": {"head": 0x03003F44, "start": 0x03000B40, "len": 0xD0 << 6},
-}
+# Allocator state, filled in per game once its heap allocator is found. Each heap is
+# a list of address-ordered nodes {+0 start, +4 size, +8 prev, +C next} placed
+# first-fit from the bottom, so the end of the last node is the footprint. Example:
+#   "main": {"head": 0x0300XXXX, "start": 0x0200XXXX, "len": 0x40000},
+HEAPS: dict[str, dict[str, int]] = {}
 
 
 def heap_footprint(e, h) -> tuple[int, int]:

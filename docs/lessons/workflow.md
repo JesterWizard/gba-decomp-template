@@ -1,6 +1,6 @@
 # Workflow lessons
 
-Process lessons from the Beyblade G Revolution decomp. Each has a *why* so you can
+Process lessons from a previous complete GBA decomp. Each has a *why* so you can
 judge edge cases.
 
 ## Matching
